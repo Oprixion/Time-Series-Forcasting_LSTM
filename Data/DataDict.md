@@ -16,9 +16,21 @@ This file contains hourly metered generation volumes for ~225 individual power p
 
 ### 2. Alberta Weather Data
 **File:** `alberta_weather_2020_2025.csv`
-**Source:** [Alberta Climate Information Service (ACIS) Weather Data Viewer](https://acis.alberta.ca/weather-data-viewer.jsp)
+**Source:** [NASA POWER (Prediction Of Worldwide Energy Resources)](https://power.larc.nasa.gov/)
 **Coverage:** January 2020 — July 2025, hourly resolution
-**How to obtain:** The fetch script was accidentally deleted. Data can be re-pulled from the ACIS Weather Data Viewer linked above. Select the desired stations (Calgary, Edmonton, Lethbridge), variables, and date range, then export as CSV. ACIS uses true MST (no daylight saving), which creates a 1-hour offset against AESO's clock-time timestamps on DST spring-forward days — see `prepare_dataset.py` for the remap logic.
+**How to obtain:** The fetch script was accidentally deleted. Data can be re-pulled via the NASA POWER API at `https://power.larc.nasa.gov/api/temporal/hourly/point` with the parameters below for each station, then joined into a single file. NASA POWER uses true MST (UTC−7, no daylight saving), which creates a 1-hour offset against AESO's clock-time timestamps on DST spring-forward days — see `prepare_dataset.py` for the remap logic.
+
+**Stations and coordinates used:**
+
+| Station | Latitude | Longitude |
+|---|---|---|
+| Calgary | 51.05 | -114.07 |
+| Edmonton | 53.55 | -113.49 |
+| Lethbridge | 49.70 | -112.83 |
+
+**API parameters:** `T2M`, `WS10M`, `WS50M`, `RH2M`, `ALLSKY_SFC_SW_DWN`
+**Community:** `RE` (Renewable Energy)
+**Temporal:** `hourly`
 
 Weather variables included:
 - `T2M` — Air temperature at 2m height (°C)
