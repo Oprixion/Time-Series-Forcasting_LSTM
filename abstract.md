@@ -6,4 +6,4 @@ Three models are trained on a chronological 80/20 train/test split to forecast t
 
 EDA and feature analysis were contributed by Mena; ARIMA modelling by Mena and Tanvir; LASSO regression by Cynthia; LSTM architecture, tuning, and model comparison by Thaison.
 
-On the held-out test set, LSTM achieves the lowest overall RMSE ([X] $/MWh) and the strongest spike capture performance (Peak RMSE: [X] $/MWh), outperforming both ARIMA ([X] $/MWh) and LASSO ([X] $/MWh) on extreme price events — demonstrating the value of sequential modelling for tail-risk forecasting in electricity markets.
+On the held-out test set, LSTM achieves the lowest overall RMSE ([56.56] $/MWh) and the strongest spike capture with a conditional peak RMSE of 439.67 $/MWh, outperforming both ARIMA ([470.63] $/MWh) and LASSO ([446.29] $/MWh) on extreme price events. Demonstrating that sequential modelling better captures the sharp fluctuations and temporal patterns driving price spikes in Alberta's electricity market.
