@@ -122,3 +122,79 @@ Raw integer encoding creates a discontinuity problem — hour 23 and hour 0 are 
 ### Final Output
 
 `Data/energy_weather_featured.csv` — 48,762 rows × 37 columns (15 continuous features, 7 lag features, 8 binary flags, 6 cyclical time encodings, 1 target), zero NaN values, monotonically increasing timestamps from 2020-01-08 to 2025-07-31. Ready for train/validation/test splitting and LSTM training.
+
+---
+
+## V3 — Wind Power Proxy, Rolling Volatility & Automated Train/Test Split
+
+Building on the clean engineered dataset from V2, three changes were made based on insights from EDA review and peer feedback:
+
+### Dropped: `is_high_wind`
+
+`is_high_wind` (WS50M_AVG > 12 m/s, 827 samples, 1.7%) had a linear correlation of 0.002 with `delta_price` — effectively zero — as confirmed by Mena's EDA correlation matrix. The high-wind regime is fully captured by the new continuous `wind_power_proxy` feature, making the binary flag redundant. Removing it reduces noise without losing any supply-side signal.
+
+### Added: `wind_power_proxy = WS50M_AVG³`
+
+Wind turbine power output scales with the cube of wind speed (P ∝ v³, from the Betz law derivation). A binary flag at 12 m/s cannot express the difference between 8 m/s (512 proxy units) and 15 m/s (3375 proxy units), both of which represent meaningfully different supply contributions. The cube relationship gives the LSTM a continuous, physics-grounded signal across the full wind speed range. Alberta wind generators bid at $0/MWh (zero marginal cost), so higher wind output displaces more expensive thermal generation and directly suppresses the SMP clearing price — `wind_power_proxy` captures this relationship continuously rather than as a hard threshold.
+
+### Added: `price_rolling_std_24 = rolling(24).std() of price_lag_1`
+
+A 24-hour rolling standard deviation of the lagged price. This encodes recent market volatility — whether the last day was quiet or turbulent — which is a strong predictor of whether the next hour is likely to spike. Computed entirely on `price_lag_1` (the previous hour's price, which is already known at prediction time), so there is no data leakage. A 24-hour window is preferred over 48 because volatility is a short-term regime signal; older history is already encoded in the lag features and the LSTM's own lookback sequence. The rolling(24) NaN warm-up period (24 rows) is already covered by the 168-row lag warm-up drop, so the final row count is unchanged.
+
+### Added: Stage 10 — Chronological Train/Test Split
+
+`prepare_dataset.py` now outputs two additional files in a single pipeline run:
+
+- `Data/train.csv` — first 80% of rows by timestamp (~39,000 rows). Used for model training and validation (internal 80/20 split within the notebook).
+- `Data/test.csv` — remaining 20% of rows by timestamp (~9,700 rows). Held out entirely for final model comparison (LSTM vs ARIMA). Must not be used for hyperparameter tuning or early stopping decisions.
+
+The split is strictly chronological with no shuffling. Automating the split inside the pipeline ensures the exact cutoff timestamp is reproducible and consistent across all team members. The full featured dataset is still saved to `energy_weather_featured.csv` for reference and EDA purposes.
+
+**Note:** The final model comparison (Section 5 of `energyPrices.ipynb`) evaluates LSTM vs. ARIMA vs. LASSO on `test.csv`.
+
+### Updated Feature Count
+
+The LSTM model input now has **26 features** (previously 25): `is_high_wind` removed (−1), `wind_power_proxy` added (+1), `price_rolling_std_24` added (+1). `INPUT_SIZE` is set dynamically in the Model SETUP cell of `energyPrices.ipynb`.
+
+---
+
+## V4 — Feature Rationalisation: Minimum Justified Set (17 Model Features)
+
+Following a critical review of all 26 features against EDA correlation results, LASSO regression coefficients (from colleague's `EDA_ARIMA__LASSO_Model_Updated.ipynb`), ablation test results, and domain knowledge, the feature set was reduced from 26 to 17 model-input features. The goal is to retain only features with clear, non-redundant causal justification — either grounded in domain physics, confirmed by EDA/LASSO signal strength, or encoding qualitative regime changes the continuous features cannot represent.
+
+### Dropped Features (9 removed)
+
+**Lag features removed:**
+- `AIL_lag_1`, `AIL_lag_24` — The LSTM's 48h lookback window already sees past AIL values as part of the input sequence. Making them explicit lags adds no information the architecture cannot already access.
+- `T2M_AVG_lag_24` — Only existed to support `is_temp_dropping_fast`. With that flag removed, this column serves no independent purpose.
+- `WS50M_AVG_lag_1` — Same reasoning as AIL lags: redundant with the sequential lookback.
+
+**Weather flags removed:**
+- `is_heating_season`, `is_cooling_season` — Both are simple threshold derivations of `T2M_AVG`, which is already in the model. The new `T2M_sq` term captures the U-shaped temperature–price relationship more expressively than two binary thresholds.
+- `is_temp_dropping_fast` — NEUTRAL in ablation test. Derivable from `T2M_AVG` and the dropped `T2M_AVG_lag_24`. Removed with its supporting lag.
+- `is_solar_generating` — Solar signal is captured by `hour_sin/cos` and `month_sin/cos`, which encode both the intra-day and seasonal structure of irradiance without an additional binary feature.
+- `is_chinook` — 0.4% prevalence (~215 samples); ablation showed marginally negative impact (removing it slightly improved RMSE). Detection criteria are imperfect due to NASA POWER's coarse spatial resolution.
+
+**Weather columns removed:**
+- `WS50M_AVG` — Computed into `wind_power_proxy` and `is_low_wind` in Stage 7, then dropped. Its raw value is fully absorbed by those two features.
+- `RH2M_AVG` — Weakest weather feature in LASSO regression (coeff −0.88 on standardised features). Temperature and wind dominate the weather signal.
+- `GHI_AVG` — Solar irradiance dropped alongside `is_solar_generating`. Intra-day and seasonal solar cycles are compactly encoded by the cyclical time features.
+- `T2M_CALGARY`, `WS50M_CALGARY`, `T2M_LETHBRIDGE`, `WS50M_LETHBRIDGE` — Were retained solely for Chinook detection. With `is_chinook` removed, these four per-city columns have no remaining use.
+
+### Added Features (2 new, from LASSO analysis)
+
+- `T2M_sq = T2M_AVG²` — Temperature has a U-shaped relationship with SMP: both extreme cold (heating demand) and extreme heat (cooling demand) drive prices up while mild temperatures are cheapest. A linear `T2M_AVG` term cannot capture this curvature. LASSO assigned a coefficient of +10.22 to this term on standardised features, confirming independent predictive value beyond the linear temperature signal.
+
+- `AIL_T2M = ACTUAL_AIL × T2M_AVG` — Second-strongest feature in the LASSO model (coeff +74.22, behind only `T2M_AVG` itself). Cold temperatures only drive prices up because load is simultaneously high — a cold night with low industrial demand behaves differently than a cold night during peak demand. The interaction term encodes this conditional relationship that neither AIL nor T2M_AVG can express independently.
+
+### Final Feature Set (17 model inputs)
+
+| Category | Features |
+|---|---|
+| Price lags | `price_lag_1`, `price_lag_24`, `price_lag_168`, `price_rolling_std_24` |
+| Demand | `ACTUAL_AIL`, `T2M_AVG`, `T2M_sq`, `AIL_T2M` |
+| Wind supply | `wind_power_proxy`, `is_low_wind` |
+| Extreme event | `is_cold_snap` |
+| Cyclical time | `hour_sin`, `hour_cos`, `dow_sin`, `dow_cos`, `month_sin`, `month_cos` |
+
+The Model SETUP cell in `energyPrices.ipynb` computes `INPUT_SIZE` dynamically from the data shape, so no manual update is needed.

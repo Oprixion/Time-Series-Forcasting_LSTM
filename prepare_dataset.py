@@ -10,11 +10,13 @@ Pipeline stages:
     2. Load & fix weather data    (DST spring-forward remap)
     3. Join on local timestamp
     4. Clean NaNs & dedup DST fall-back rows
-    5. Drop redundant per-city weather (keep Calgary/Lethbridge for Chinook)
-    6. Engineer lag features       (price, AIL, temperature, wind)
-    7. Engineer weather flags      (8 binary flags)
+    5. Drop redundant weather columns (all per-city; retain T2M_AVG + WS50M_AVG for Stage 7)
+    6. Engineer lag features       (price lags t-1/24/168 + 24h rolling volatility)
+    7. Engineer model features     (wind proxy, cold snap, T² term, AIL×T interaction;
+                                    drop WS50M_AVG after use)
     8. Define target variable      (ΔPrice = hourly absolute change)
     9. Add cyclical time features  (sin/cos for hour, day-of-week, month)
+   10. Chronological train/test split (80% train, 20% test) → train.csv, test.csv
 """
 
 import pandas as pd
@@ -27,6 +29,10 @@ DATA_DIR = Path(__file__).parent / "Data"
 ENERGY_PATH  = DATA_DIR / "Hourly_Metered_Volumes_and_Pool_Price_and_AIL_2020-Jul2025.csv"
 WEATHER_PATH = DATA_DIR / "alberta_weather_2020_2025.csv"
 OUTPUT_PATH  = DATA_DIR / "energy_weather_featured.csv"
+TRAIN_PATH   = DATA_DIR / "train.csv"
+TEST_PATH    = DATA_DIR / "test.csv"
+
+TRAIN_RATIO  = 0.80   # chronological split — no shuffling
 
 
 # =============================================================================
@@ -152,11 +158,14 @@ def clean_and_dedup(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 def drop_redundant_weather(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Drop per-city columns that are redundant with province averages.
-    Keep Calgary & Lethbridge T2M, WS50M, RH2M for Chinook detection.
-    Drop all Edmonton per-city (captured by AVG).
-    Drop all WS10M (redundant with WS50M, which is hub-height).
-    Drop per-city solar (captured by GHI_AVG).
+    Drop all per-city and redundant weather columns.
+
+    Retained for downstream stages:
+        T2M_AVG     — dominant temperature signal (LASSO coeff -78.11); feeds T2M_sq and AIL_T2M
+        WS50M_AVG   — hub-height wind speed; feeds wind_power_proxy and is_low_wind (dropped after Stage 7)
+
+    Everything else is either captured by those two averages, feeds no remaining engineered feature,
+    or was shown to contribute negligible signal (RH2M_AVG, GHI_AVG).
     """
     print("\nDropping redundant weather columns...")
 
@@ -167,7 +176,7 @@ def drop_redundant_weather(df: pd.DataFrame) -> pd.DataFrame:
         "WS50M_EDMONTON",
         "RH2M_EDMONTON",
         "ALLSKY_SFC_SW_DWN_EDMONTON",
-        # Imports per-city — redundant with provincial imports, and not directly relevant to SMP price
+        # Inter-provincial imports — not directly relevant to SMP price formation
         "IMPORT_BC",
         "IMPORT_MT",
         "IMPORT_SK",
@@ -175,15 +184,26 @@ def drop_redundant_weather(df: pd.DataFrame) -> pd.DataFrame:
         "WS10M_CALGARY",
         "WS10M_LETHBRIDGE",
         "WS10M_AVG",
-        # Per-city solar — captured by GHI_AVG
+        # Per-city solar — GHI_AVG is also dropped; solar signal captured by hour/month encodings
         "ALLSKY_SFC_SW_DWN_CALGARY",
         "ALLSKY_SFC_SW_DWN_LETHBRIDGE",
-        # Per-city RH — Chinook no longer uses RH (NASA POWER too coarse),
-        # and RH2M_AVG captures the general humidity signal
+        # GHI_AVG — solar irradiance dropped; intra-day and seasonal cycles already encoded
+        # by hour_sin/cos and month_sin/cos, which are more compact and non-redundant
+        "GHI_AVG",
+        # Per-city RH and provincial RH — weakest weather feature (LASSO coeff -0.88);
+        # temperature and wind fully dominate the weather signal
         "RH2M_CALGARY",
         "RH2M_LETHBRIDGE",
-        # Price Forecast — not a weather column, and we want to predict actual price without peeking at forecasts
-        "HOUR_AHEAD_POOL_PRICE_FORECAST"
+        "RH2M_AVG",
+        # Per-city Calgary & Lethbridge T2M and WS50M — previously retained for Chinook
+        # detection only. Chinook flag dropped (0.4% prevalence, ablation-negative,
+        # imperfect detection). No remaining use for per-city columns.
+        "T2M_CALGARY",
+        "WS50M_CALGARY",
+        "T2M_LETHBRIDGE",
+        "WS50M_LETHBRIDGE",
+        # Price Forecast — excluded to prevent peeking at AESO's own forward estimate
+        "HOUR_AHEAD_POOL_PRICE_FORECAST",
     ]
 
     existing = [c for c in drop_cols if c in df.columns]
@@ -199,11 +219,22 @@ def drop_redundant_weather(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add lag features for LSTM forecasting.
+    Add price lag features and rolling volatility.
 
-    Price lags:  t-1 (autocorrelation), t-24 (daily), t-168 (weekly)
-    AIL lags:    t-1 (demand momentum), t-24 (demand norm comparison)
-    Weather lags: T2M_AVG t-24 (heating/cooling ramp), WS50M_AVG t-1 (wind ramp)
+    Price lags:
+        t-1   — strongest single predictor (LASSO coeff -38.54); anchors the delta_price target.
+        t-24  — same-hour-yesterday daily cycle (LASSO coeff +14.40).
+        t-168 — same-hour-last-week weekly cycle (LASSO coeff +5.94); confirmed independent
+                signal even after controlling for dow_sin/cos encodings.
+
+    Rolling volatility:
+        price_rolling_std_24 — 24h std of price_lag_1. Encodes whether the past day was
+        quiet or turbulent. Volatility clusters in energy markets; a turbulent recent window
+        predicts higher spike likelihood. Computed on lagged prices only — no leakage.
+
+    AIL lags and weather lags (AIL_lag_1, AIL_lag_24, T2M_AVG_lag_24, WS50M_AVG_lag_1)
+    are excluded: the LSTM's 48h lookback window provides the same information through
+    the sequential input, making explicit lags of these variables redundant.
     """
     print("\nAdding lag features...")
 
@@ -211,19 +242,25 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
         ("ACTUAL_POOL_PRICE", 1,   "price_lag_1"),
         ("ACTUAL_POOL_PRICE", 24,  "price_lag_24"),
         ("ACTUAL_POOL_PRICE", 168, "price_lag_168"),
-        ("ACTUAL_AIL",        1,   "AIL_lag_1"),
-        ("ACTUAL_AIL",        24,  "AIL_lag_24"),
-        ("T2M_AVG",           24,  "T2M_AVG_lag_24"),
-        ("WS50M_AVG",         1,   "WS50M_AVG_lag_1"),
     ]
 
     for source_col, lag, new_name in lag_specs:
         df[new_name] = df[source_col].shift(lag)
         print(f"  {new_name:<25s} = {source_col} shifted by {lag}h")
 
-    # Drop rows where the largest lag (168) creates NaNs
+    # Rolling 24h price volatility — computed on price_lag_1 (fully historical,
+    # no leakage). A 24-window captures yesterday's market turbulence, which is
+    # the most relevant context for whether the next hour is likely to spike.
+    # Window=24 is preferable to 48 because volatility is a short-term signal —
+    # older history is already encoded in the lag features and LSTM sequence.
+    df["price_rolling_std_24"] = df["price_lag_1"].rolling(window=24).std()
+    print(f"  {'price_rolling_std_24':<25s} = rolling(24).std() of price_lag_1")
+
+    # Drop rows where any lag or rolling feature creates NaNs.
+    # The largest lag (168h) dominates — rolling(24) NaNs are already covered.
     n_before = len(df)
-    df = df.dropna(subset=[name for _, _, name in lag_specs]).reset_index(drop=True)
+    drop_subset = [name for _, _, name in lag_specs] + ["price_rolling_std_24"]
+    df = df.dropna(subset=drop_subset).reset_index(drop=True)
     n_after = len(df)
     print(f"  Rows dropped (lag warm-up): {n_before - n_after}")
     print(f"  Shape after lags: {df.shape}")
@@ -236,65 +273,61 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 def add_weather_flags(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add binary weather flags with clear causal links to SMP.
+    Engineer the final model features from raw weather and demand columns.
 
-    Temperature flags:
-        is_heating_season       T2M_AVG < 10°C       — elevated heating demand
-        is_cooling_season       T2M_AVG > 20°C        — AC load increase
-        is_cold_snap            T2M_AVG < -20°C       — demand surge + supply risk
-        is_temp_dropping_fast   ΔT24h < -8°C          — demand ramp surprise
+    Wind (supply side):
+        is_low_wind        WS50M_AVG < 4 m/s   — binary cut-in flag. The regime change at
+                                                   cut-in speed is a step function that the
+                                                   continuous proxy cannot represent alone.
+        wind_power_proxy   WS50M_AVG³           — continuous supply signal (P ∝ v³, Betz law).
+                                                   Alberta wind generators bid at $0/MWh;
+                                                   higher wind output directly suppresses SMP.
+                                                   The cube transformation correctly weights
+                                                   high-speed events over low-speed ones.
 
-    Wind flags:
-        is_low_wind             WS50M_AVG < 4 m/s     — below turbine cut-in
-        is_high_wind            WS50M_AVG > 12 m/s    — heavy wind generation
+    Temperature (demand + supply side):
+        is_cold_snap       T2M_AVG < -20°C      — extreme cold simultaneously surges heating
+                                                   demand AND risks gas freeze-offs (supply risk).
+                                                   Ablation confirmed signal; the only binary flag
+                                                   encoding an unobserved supply-side variable.
+        T2M_sq             T2M_AVG²             — temperature has a U-shaped relationship with
+                                                   price: both extreme cold and extreme heat drive
+                                                   prices up. The squared term captures this
+                                                   curvature (LASSO coeff +10.22 on standardised
+                                                   features).
 
-    Solar flag:
-        is_solar_generating     GHI_AVG > 50 W/m²     — daytime solar output
+    Demand × temperature interaction:
+        AIL_T2M            ACTUAL_AIL × T2M_AVG — second-strongest LASSO feature (coeff +74.22).
+                                                   Cold temperatures only drive prices up because
+                                                   demand is simultaneously high; the interaction
+                                                   encodes this joint effect that neither feature
+                                                   alone can express.
 
-    Chinook flag (Calgary-specific):
-        is_chinook              T2M_CALGARY jumps >10°C in 24h
-                                + WS50M_CALGARY > 10 m/s
-                                + RH2M_CALGARY < 40%
+    WS50M_AVG is dropped at the end of this stage — its information is fully absorbed
+    into wind_power_proxy and is_low_wind.
     """
-    print("\nAdding weather flags...")
+    print("\nEngineering model features...")
 
-    # ── Temperature flags ────────────────────────────────────────────────
-    df["is_heating_season"] = (df["T2M_AVG"] < 10).astype(int)
-    df["is_cooling_season"] = (df["T2M_AVG"] > 20).astype(int)
-    df["is_cold_snap"]      = (df["T2M_AVG"] < -20).astype(int)
+    # ── Wind features ────────────────────────────────────────────────────
+    df["is_low_wind"]      = (df["WS50M_AVG"] < 4).astype(int)
+    df["wind_power_proxy"] = df["WS50M_AVG"] ** 3
 
-    # Rapid cooling: current temp vs. 24h ago (T2M_AVG_lag_24 already exists)
-    df["is_temp_dropping_fast"] = (
-        (df["T2M_AVG"] - df["T2M_AVG_lag_24"]) < -8
-    ).astype(int)
+    # ── Temperature features ─────────────────────────────────────────────
+    df["is_cold_snap"] = (df["T2M_AVG"] < -20).astype(int)
+    df["T2M_sq"]       = df["T2M_AVG"] ** 2
 
-    # ── Wind flags ───────────────────────────────────────────────────────
-    df["is_low_wind"]  = (df["WS50M_AVG"] < 4).astype(int)
-    df["is_high_wind"] = (df["WS50M_AVG"] > 12).astype(int)
+    # ── Demand × temperature interaction ─────────────────────────────────
+    df["AIL_T2M"] = df["ACTUAL_AIL"] * df["T2M_AVG"]
 
-    # ── Solar flag ───────────────────────────────────────────────────────
-    df["is_solar_generating"] = (df["GHI_AVG"] > 50).astype(int)
+    # ── Drop WS50M_AVG — absorbed into wind features ─────────────────────
+    df = df.drop(columns=["WS50M_AVG"])
 
-    # ── Chinook flag (requires Calgary per-city columns) ─────────────────
-    # Chinook = rapid warming in Calgary + strong wind, restricted to winter.
-    # NASA POWER's coarse grid doesn't capture the RH drop well, so we use
-    # temp rise + wind + winter season as the detection criteria.
-    T2M_calgary_lag_24 = df["T2M_CALGARY"].shift(24)
-    is_winter_month = df["Date_Begin_Local"].dt.month.isin([10, 11, 12, 1, 2, 3])
-    df["is_chinook"] = (
-        ((df["T2M_CALGARY"] - T2M_calgary_lag_24) > 10)
-        & (df["WS50M_CALGARY"] > 8)
-        & is_winter_month
-    ).astype(int).fillna(0).astype(int)
-
-    # ── Report sample counts ─────────────────────────────────────────────
-    flag_cols = [c for c in df.columns if c.startswith("is_")]
-    print(f"\n  {'Flag':<30s} {'True':>8s} {'%':>8s}")
-    print(f"  {'─' * 30} {'─' * 8} {'─' * 8}")
-    for col in flag_cols:
-        n_true = df[col].sum()
-        pct = 100 * n_true / len(df)
-        print(f"  {col:<30s} {n_true:>8,.0f} {pct:>7.1f}%")
+    # ── Report ────────────────────────────────────────────────────────────
+    print(f"  is_low_wind      : {df['is_low_wind'].sum():>6,} samples  ({100*df['is_low_wind'].mean():.1f}%)")
+    print(f"  is_cold_snap     : {df['is_cold_snap'].sum():>6,} samples  ({100*df['is_cold_snap'].mean():.1f}%)")
+    print(f"  wind_power_proxy : mean={df['wind_power_proxy'].mean():.1f},  max={df['wind_power_proxy'].max():.1f}")
+    print(f"  T2M_sq           : mean={df['T2M_sq'].mean():.1f}")
+    print(f"  AIL_T2M          : mean={df['AIL_T2M'].mean():.1f}")
 
     return df
 
@@ -371,6 +404,45 @@ def add_cyclical_time_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# STAGE 10 — Chronological train / test split
+# =============================================================================
+def split_and_save(df: pd.DataFrame, train_ratio: float = TRAIN_RATIO) -> None:
+    """
+    Split the fully featured dataset into train and test sets chronologically
+    and write each to its own CSV file.
+
+    The split is strictly chronological — no shuffling — to preserve the
+    time-series structure and prevent any future data leaking into training.
+    The test set is held out entirely for final model comparison (LSTM vs ARIMA)
+    and must not be used for hyperparameter tuning or early stopping decisions.
+
+    Split:
+        train.csv — first 80% of rows by timestamp
+        test.csv  — remaining 20% of rows by timestamp
+    """
+    print("\nSplitting into train / test sets...")
+
+    split_idx  = int(len(df) * train_ratio)
+    train      = df.iloc[:split_idx].reset_index(drop=True)
+    test       = df.iloc[split_idx:].reset_index(drop=True)
+
+    train_start = train["Date_Begin_Local"].iloc[0]
+    train_end   = train["Date_Begin_Local"].iloc[-1]
+    test_start  = test["Date_Begin_Local"].iloc[0]
+    test_end    = test["Date_Begin_Local"].iloc[-1]
+
+    print(f"  Train : {len(train):>6,} rows  |  {train_start} → {train_end}")
+    print(f"  Test  : {len(test):>6,} rows  |  {test_start}  → {test_end}")
+    print(f"  Split ratio: {len(train)/len(df)*100:.1f}% / {len(test)/len(df)*100:.1f}%")
+
+    train.to_csv(TRAIN_PATH, index=False)
+    test.to_csv(TEST_PATH,   index=False)
+
+    print(f"  Saved train → {TRAIN_PATH}  ({TRAIN_PATH.stat().st_size / 1e6:.1f} MB)")
+    print(f"  Saved test  → {TEST_PATH}   ({TEST_PATH.stat().st_size / 1e6:.1f} MB)")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 def main():
@@ -402,6 +474,9 @@ def main():
 
     # Stage 9: Cyclical time features
     df = add_cyclical_time_features(df)
+
+    # Stage 10: Train / test split
+    split_and_save(df)
 
     # ── Final summary ────────────────────────────────────────────────────
     print("\n" + "=" * 70)
